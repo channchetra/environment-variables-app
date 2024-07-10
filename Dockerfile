@@ -1,49 +1,64 @@
 FROM node:20-alpine AS base
 
-# Setup env variabless for yarn and nextjs
-ENV NEXT_TELEMETRY_DISABLED=1 NODE_ENV=production YARN_VERSION=4.2.2
+# --- Dependencies ---
+### Rebuild deps only when needed ###
+FROM base AS deps
+RUN apk add --no-cache libc6-compat git
 
-# update dependencies, add libc6-compat and dumb-init to the base image
-RUN apk update && apk upgrade && apk add --no-cache libc6-compat && apk add dumb-init
+RUN echo Building nextjs image with corepack
 
-# install and use yarn 4.x
-RUN corepack enable && corepack prepare yarn@${YARN_VERSION}
+# Setup pnpm environment
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+RUN corepack enable
+RUN corepack prepare pnpm@latest --activate
 
-# add the user and group we'll need in our final image
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
+WORKDIR /app
 
-# Install dependencies only when needed
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prefer-frozen-lockfile
+
+# --- Builder ---
 FROM base AS builder
+RUN corepack enable
+RUN corepack prepare pnpm@latest --activate
+
 WORKDIR /app
 
+COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-COPY package.json yarn.lock .yarnrc.yml ./
-COPY .yarn ./.yarn
-RUN yarn install --immutable
+RUN pnpm build
 
-# Add `ARG` instructions below if you need `NEXT_PUBLIC_` variables
-# then put the value on your fly.toml
-# Example:
-# ARG NEXT_PUBLIC_SOMETHING
-
-# Build the app (in standalone mode based on next.config.js)
-RUN yarn build
-
-# Production image, copy all the files and run next
+# --- Production runner ---
 FROM base AS runner
-WORKDIR /app
+# Set NODE_ENV to production
+ENV NODE_ENV production
 
-# copy the public folder from the project as this is not included in the build process
-COPY --from=builder --chown=nextjs:nodejs /app/public ./public
-# copy the standalone folder inside the .next folder generated from the build process
+# Disable Next.js telemetry
+# Learn more here: https://nextjs.org/telemetry
+ENV NEXT_TELEMETRY_DISABLED 1
+
+# Set correct permissions for nextjs user
+# Don't run as root
+RUN addgroup nodejs
+RUN adduser -SDH nextjs
+RUN mkdir .next
+RUN chown nextjs:nodejs .next
+
+# Automatically leverage output traces to reduce image size
+# https://nextjs.org/docs/advanced-features/output-file-tracing
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-# copy the static folder inside the .next folder generated from the build process
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 USER nextjs
 
+# Expose ports (for orchestrators and dynamic reverse proxies)
 EXPOSE 3000
 ENV PORT 3000
+ENV HOSTNAME "0.0.0.0"
 
-CMD ["dumb-init","node","server.js"]
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 CMD [ "wget", "-q0", "http://localhost:3000/health" ]
+
+# Run the nextjs app
+CMD ["node", "server.js"]
